@@ -11,27 +11,25 @@ from datetime import datetime
 
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
-REPORT_DIR = "comparison"
+COMPARISON_DIR = "comparison"
+MEMORY_DIR = os.path.join(COMPARISON_DIR, "memory")
 
-TRAINING_JSONL = os.path.join(REPORT_DIR, "translation_training.jsonl")
-TRAINING_JSON = os.path.join(REPORT_DIR, "translation_training.json")
-FEEDBACK_JSON = os.path.join(REPORT_DIR, "translation_feedback.json")
-TRAINING_DB_JSONL = os.path.join(REPORT_DIR, "translation_training_db.jsonl")
+MEMORY_JSONL = os.path.join(MEMORY_DIR, "translation_memory.jsonl")
+MEMORY_JSON = os.path.join(MEMORY_DIR, "translation_memory.json")
 
-# Translation Memory
-MEMORY_DIR = os.path.join(REPORT_DIR, "memory")
-MEMORY_FILE = os.path.join(MEMORY_DIR, "translation_memory.jsonl")
-MEMORY_INDEX_FILE = os.path.join(MEMORY_DIR, "translation_memory.json")
+COMPARISON_REPORT = os.path.join(COMPARISON_DIR, "comparison.txt")
+COMPARISON_JSON = os.path.join(COMPARISON_DIR, "comparison.json")
 
-# ใช้ AI เฉพาะตอน "จัดหมวดหมู่" Memory ใหม่
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MEMORY_MODEL = "qwen3:4b"
+
 MEMORY_BATCH_SIZE = 20
-MEMORY_TIMEOUT = 60
-MEMORY_RETRIES = 2
+OLLAMA_TIMEOUT = 120
+OLLAMA_RETRIES = 3
 
 MEMORY_CATEGORIES = {
     "character",
+    "place",
     "verb",
     "object",
     "terminology",
@@ -50,7 +48,7 @@ def parse_srt(path):
         content = f.read()
 
     blocks = re.split(r"\n\s*\n", content.strip())
-    subtitles = {}
+    result = {}
 
     for block in blocks:
         lines = block.strip().splitlines()
@@ -59,21 +57,21 @@ def parse_srt(path):
             continue
 
         try:
-            index = int(lines[0].strip())
+            subtitle_id = int(lines[0].strip())
         except ValueError:
             continue
 
-        subtitles[index] = {
-            "index": index,
+        result[subtitle_id] = {
+            "id": subtitle_id,
             "timecode": lines[1].strip(),
             "text": "\n".join(lines[2:]).strip(),
         }
 
-    return subtitles
+    return result
 
 
 def find_srt_files(directory):
-    if not os.path.exists(directory):
+    if not os.path.isdir(directory):
         return []
 
     return sorted(
@@ -91,40 +89,47 @@ def select_file(directory, title):
     print("=" * 80)
 
     if not files:
-        print(f"ไม่พบไฟล์ SRT ใน {directory}/")
+        print("ไม่พบไฟล์ .srt")
         return None
 
-    for i, filename in enumerate(files, 1):
-        print(f"{i}. {filename}")
+    for i, name in enumerate(files, 1):
+        print(f"{i}. {name}")
 
     while True:
         choice = input("\nเลือกหมายเลขไฟล์: ").strip()
+
+        if choice.lower() in {"q", "quit", "exit"}:
+            return None
 
         if not choice.isdigit():
             print("กรุณาใส่หมายเลข")
             continue
 
-        number = int(choice)
+        n = int(choice)
 
-        if 1 <= number <= len(files):
-            return os.path.join(directory, files[number - 1])
+        if 1 <= n <= len(files):
+            return os.path.join(directory, files[n - 1])
 
         print("หมายเลขไม่ถูกต้อง")
 
 
 def normalize_text(text):
-    if not text:
+    if text is None:
         return ""
 
+    text = str(text)
     text = text.replace("\\N", " ")
     text = re.sub(r"\s+", " ", text)
-
     return text.strip()
 
 
-def similarity(text1, text2):
-    a = normalize_text(text1)
-    b = normalize_text(text2)
+# ============================================================
+# COMPARISON
+# ============================================================
+
+def similarity(a, b):
+    a = normalize_text(a)
+    b = normalize_text(b)
 
     if not a and not b:
         return 1.0
@@ -135,522 +140,95 @@ def similarity(text1, text2):
     return SequenceMatcher(None, a, b).ratio()
 
 
-# ============================================================
-# COMPARISON
-# ============================================================
+def compare_gold_ai(gold_data, ai_data):
+    """
+    เปรียบเทียบตาม subtitle ID
+    ไม่แก้ไข Gold หรือ AI output
+    """
 
-def compare_srt(source, gold, rag):
-    source_data = parse_srt(source)
-    gold_data = parse_srt(gold)
-    rag_data = parse_srt(rag)
-
-    all_ids = sorted(
-        set(source_data) |
-        set(gold_data) |
-        set(rag_data)
-    )
-
+    all_ids = sorted(set(gold_data) | set(ai_data))
     results = []
 
-    for index in all_ids:
-        source_item = source_data.get(index)
-        gold_item = gold_data.get(index)
-        rag_item = rag_data.get(index)
+    for subtitle_id in all_ids:
+        gold = gold_data.get(subtitle_id)
+        ai = ai_data.get(subtitle_id)
 
-        source_text = source_item["text"] if source_item else ""
-        gold_text = gold_item["text"] if gold_item else ""
-        rag_text = rag_item["text"] if rag_item else ""
+        gold_text = gold["text"] if gold else ""
+        ai_text = ai["text"] if ai else ""
+
+        score = similarity(gold_text, ai_text)
 
         results.append({
-            "index": index,
+            "id": subtitle_id,
             "timecode": (
-                source_item["timecode"] if source_item
-                else gold_item["timecode"] if gold_item
-                else rag_item["timecode"] if rag_item
+                gold["timecode"] if gold
+                else ai["timecode"] if ai
                 else ""
             ),
-            "source": source_text,
             "gold": gold_text,
-            "rag": rag_text,
-            "gold_similarity_to_source": similarity(
-                source_text, gold_text
-            ),
-            "rag_similarity_to_source": similarity(
-                source_text, rag_text
-            ),
-            "gold_vs_rag": similarity(
-                gold_text, rag_text
-            ),
-            "same": (
-                normalize_text(gold_text) ==
-                normalize_text(rag_text)
-            ),
-            "source_exists": source_item is not None,
-            "gold_exists": gold_item is not None,
-            "rag_exists": rag_item is not None,
+            "ai": ai_text,
+            "similarity": round(score, 6),
+            "gold_exists": gold is not None,
+            "ai_exists": ai is not None,
         })
 
     return results
 
 
-# ============================================================
-# TRAINING DATA
-# ============================================================
-
-def training_key(example):
-    source = normalize_text(
-        example.get("source_zh", "")
-    )
-    target = normalize_text(
-        example.get("target_th", "")
-    )
-
-    return (
-        source.casefold(),
-        target.casefold()
-    )
-
-
-def load_existing_training_keys():
-    keys = set()
-
-    if not os.path.exists(TRAINING_DB_JSONL):
-        return keys
-
-    with open(
-        TRAINING_DB_JSONL,
-        "r",
-        encoding="utf-8"
-    ) as f:
-        for line in f:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            try:
-                item = json.loads(line)
-                key = training_key(item)
-
-                if key[0] and key[1]:
-                    keys.add(key)
-
-            except json.JSONDecodeError:
-                continue
-
-    return keys
-
-
-def append_new_training_examples(examples):
-    existing_keys = load_existing_training_keys()
-
-    new_examples = []
-    duplicate_count = 0
-
-    for example in examples:
-        key = training_key(example)
-
-        if not key[0] or not key[1]:
-            continue
-
-        if key in existing_keys:
-            duplicate_count += 1
-            continue
-
-        existing_keys.add(key)
-        new_examples.append(example)
-
-    if new_examples:
-        with open(
-            TRAINING_DB_JSONL,
-            "a",
-            encoding="utf-8"
-        ) as f:
-            for example in new_examples:
-                f.write(
-                    json.dumps(
-                        example,
-                        ensure_ascii=False
-                    ) + "\n"
-                )
-
-    return new_examples, duplicate_count
-
-
-def deduplicate_examples(examples):
-    seen = set()
-    unique = []
-    duplicate_count = 0
-
-    for example in examples:
-        key = training_key(example)
-
-        if key in seen:
-            duplicate_count += 1
-            continue
-
-        seen.add(key)
-        unique.append(example)
-
-    return unique, duplicate_count
-
-
-def build_training_examples(
-    results,
-    source_file,
-    gold_file,
-    rag_file
-):
-    examples = []
-
-    for item in results:
-        if not item["source_exists"]:
-            continue
-
-        if not item["gold_exists"]:
-            continue
-
-        source = item["source"].strip()
-        gold = item["gold"].strip()
-        rag = item["rag"].strip()
-
-        if not source or not gold:
-            continue
-
-        if item["rag_exists"] and item["same"]:
-            example_type = "approved"
-        elif item["rag_exists"]:
-            example_type = "corrected"
-        else:
-            example_type = "missing_output"
-
-        examples.append({
-            "id": item["index"],
-            "source_zh": source,
-            "target_th": gold,
-            "previous_rag": rag,
-            "example_type": example_type,
-            "previous_similarity": round(
-                item["gold_vs_rag"], 4
-            ),
-            "source_to_gold_similarity": round(
-                item["gold_similarity_to_source"], 4
-            ),
-            "timecode": item["timecode"],
-            "source_file": os.path.basename(source_file),
-            "gold_file": os.path.basename(gold_file),
-            "rag_file": os.path.basename(rag_file),
-        })
-
-    return examples
-
-
-def export_training_data(
-    results,
-    source_file,
-    gold_file,
-    rag_file
-):
-    os.makedirs(REPORT_DIR, exist_ok=True)
-
-    examples = build_training_examples(
-        results,
-        source_file,
-        gold_file,
-        rag_file
-    )
-
-    examples, duplicate_in_run = deduplicate_examples(
-        examples
-    )
-
-    new_examples, duplicate_from_history = (
-        append_new_training_examples(examples)
-    )
-
-    timestamp = datetime.now().isoformat(
-        timespec="seconds"
-    )
-
-    dataset = {
-        "version": "1.0",
-        "created_at": timestamp,
-        "purpose": (
-            "Translation memory / feedback dataset "
-            "for next-round Chinese-to-Thai subtitle translation"
-        ),
-        "source_file": os.path.basename(source_file),
-        "gold_file": os.path.basename(gold_file),
-        "rag_file": os.path.basename(rag_file),
-        "total_examples": len(new_examples),
-        "duplicates_in_current_run": duplicate_in_run,
-        "duplicates_from_previous_runs": (
-            duplicate_from_history
-        ),
-        "examples": new_examples,
-    }
-
-    with open(
-        TRAINING_JSONL,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        for example in new_examples:
-            f.write(
-                json.dumps(
-                    example,
-                    ensure_ascii=False
-                ) + "\n"
-            )
-
-    with open(
-        TRAINING_JSON,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            dataset,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    corrected = [
-        x for x in new_examples
-        if x["example_type"] == "corrected"
+def calculate_overall_score(results):
+    valid = [
+        x for x in results
+        if x["gold_exists"] and x["ai_exists"]
     ]
 
-    approved = [
-        x for x in new_examples
-        if x["example_type"] == "approved"
-    ]
+    if not valid:
+        return 0.0
 
-    feedback = {
-        "version": "1.0",
-        "created_at": timestamp,
-        "statistics": {
-            "total": len(examples),
-            "approved": len(approved),
-            "corrected": len(corrected),
-            "missing_output": sum(
-                x["example_type"] == "missing_output"
-                for x in examples
-            ),
-        },
-        "corrections": [
-            {
-                "source_zh": x["source_zh"],
-                "wrong_translation": x["previous_rag"],
-                "correct_translation": x["target_th"],
-                "similarity": x["previous_similarity"],
-                "id": x["id"],
-            }
-            for x in corrected
-        ],
-        "approved_examples": [
-            {
-                "source_zh": x["source_zh"],
-                "translation": x["target_th"],
-                "id": x["id"],
-            }
-            for x in approved
-        ],
-    }
-
-    with open(
-        FEEDBACK_JSON,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            feedback,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    return (
-        new_examples,
-        duplicate_in_run,
-        duplicate_from_history
-    )
+    return sum(x["similarity"] for x in valid) / len(valid)
 
 
 # ============================================================
-# SIMPLE TRANSLATION MEMORY
-# ============================================================
-
-def memory_key(source, target):
-    return (
-        normalize_text(source).casefold(),
-        normalize_text(target).casefold()
-    )
-
-
-def load_memory():
-    memory = {}
-
-    if not os.path.exists(MEMORY_FILE):
-        return memory
-
-    with open(
-        MEMORY_FILE,
-        "r",
-        encoding="utf-8"
-    ) as f:
-        for line in f:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            source = normalize_text(
-                item.get("source", "")
-            )
-            target = normalize_text(
-                item.get("target", "")
-            )
-
-            if not source or not target:
-                continue
-
-            memory[memory_key(source, target)] = item
-
-    return memory
-
-
-def save_memory(memory):
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-
-    items = list(memory.values())
-
-    items.sort(
-        key=lambda x: (
-            x.get("count", 0),
-            x.get("source", "")
-        ),
-        reverse=True
-    )
-
-    with open(
-        MEMORY_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        for item in items:
-            f.write(
-                json.dumps(
-                    item,
-                    ensure_ascii=False
-                ) + "\n"
-            )
-
-    # ทำ index แบบอ่านง่ายสำหรับ debugging / GUI
-    by_category = {}
-
-    for item in items:
-        category = item.get(
-            "category",
-            "other"
-        )
-
-        by_category.setdefault(
-            category,
-            []
-        ).append(item)
-
-    with open(
-        MEMORY_INDEX_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            {
-                "version": "1.0",
-                "updated_at": datetime.now().isoformat(
-                    timespec="seconds"
-                ),
-                "total": len(items),
-                "categories": by_category,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-
-def is_memory_candidate(source, target, example_type):
-    """
-    ใช้ข้อมูล Training DB ทั้งหมดเป็น Translation Memory
-
-    ไม่กรองตามความยาวหรือ example_type
-    เพราะ Gold เป็นข้อมูลที่ผ่านการยอมรับแล้ว
-
-    AI มีหน้าที่ "จัดหมวดหมู่" เท่านั้น
-    ไม่ได้สร้างหรือแก้คำแปล
-    """
-    source = normalize_text(source)
-    target = normalize_text(target)
-
-    return bool(source and target)
-
-
-# ============================================================
-# AI CATEGORY CLASSIFIER
+# OLLAMA
 # ============================================================
 
 MEMORY_SYSTEM_PROMPT = r"""
-คุณมีหน้าที่จัดหมวดหมู่ Translation Memory
-สำหรับระบบแปลซับไตเติลจีน -> ไทย
+You build a Chinese -> Thai subtitle translation memory.
 
-คุณไม่ได้แปลข้อความ
-คุณไม่ได้แก้ source
-คุณไม่ได้แก้ target
+Your task is ONLY to extract reusable ATOMIC words or SHORT PHRASES
+from SOURCE and their exact corresponding Thai wording from GOLD.
 
-ให้เลือก category ได้เพียงหนึ่งค่า:
+IMPORTANT:
+1. SOURCE must be copied exactly from the Chinese SOURCE.
+2. TARGET must be copied exactly from the Thai GOLD.
+3. Never invent, rewrite, paraphrase, translate, normalize, or correct
+   SOURCE or TARGET.
+4. Do NOT store whole subtitle sentences.
+5. Prefer individual words or short phrases.
+6. A longer phrase is allowed only when it is a fixed expression,
+   person's name, place name, title, terminology, or another unit whose
+   meaning depends on the complete phrase.
+7. Ignore generic particles and meaningless fragments.
+8. Every SOURCE must be a contiguous substring of SOURCE.
+9. Every TARGET must be a contiguous substring of GOLD.
+10. Return category exactly as one of:
+    character, place, verb, object, terminology, expression,
+    scene, description, other.
+11. Return JSON only.
 
-character
-verb
-object
-terminology
-expression
-scene
-description
-other
-
-ความหมาย:
-- character = ชื่อคน ชื่อตัวละคร ชื่อเฉพาะของบุคคล
-- verb = คำกริยาหรือการกระทำที่เป็นคำ/วลีสั้น
-- object = สิ่งของ อาหาร สถานที่ สิ่งเฉพาะ
-- terminology = ศัพท์เฉพาะ ตำแหน่ง ยศ ธุรกิจ กฎหมาย ฯลฯ
-- expression = สำนวน คำพูดติดปาก วลีที่ควรจำเป็นคู่
-- scene = ข้อความบรรยายฉาก เช่น [ในห้อง] หรือ [กลางคืน]
-- description = ข้อความบรรยายเหตุการณ์/ภาพ เช่น [เธอเดินจากไป]
-- other = อย่างอื่น
-
-ตอบ JSON เท่านั้น:
-
+Output:
 {
   "items": [
     {
-      "id": 1,
-      "category": "character"
+      "source": "中国原文中的词或短语",
+      "target": "Gold中的泰文词或短语",
+      "category": "terminology"
     }
   ]
 }
 """
 
 
-def call_ollama_json(
-    system_prompt,
-    user_prompt,
-    timeout=MEMORY_TIMEOUT
-):
+def call_ollama(system_prompt, user_prompt):
     payload = {
         "model": MEMORY_MODEL,
         "messages": [
@@ -669,7 +247,7 @@ def call_ollama_json(
         "options": {
             "temperature": 0.0,
             "num_ctx": 4096,
-            "num_predict": 1024,
+            "num_predict": 2048,
         },
         "keep_alive": "10m",
     }
@@ -677,369 +255,40 @@ def call_ollama_json(
     response = requests.post(
         OLLAMA_URL,
         json=payload,
-        timeout=timeout
+        timeout=OLLAMA_TIMEOUT,
     )
 
     response.raise_for_status()
 
     data = response.json()
+    content = data.get("message", {}).get("content", "")
 
+    if not content:
+        raise ValueError(
+            f"Ollama ไม่มี response: {data}"
+        )
+
+    return content.strip()
+
+
+# ============================================================
+# MEMORY
+# ============================================================
+
+def memory_key(source, target):
     return (
-        data.get("message", {})
-        .get("content", "")
-        .strip()
+        normalize_text(source).casefold(),
+        normalize_text(target).casefold(),
     )
-
-
-def classify_memory_batch(items, batch_no, total_batches):
-    """
-    AI ทำแค่ category
-    source/target ไม่ให้ AI แก้
-    """
-
-    payload_items = []
-
-    for item in items:
-        payload_items.append({
-            "id": item["id"],
-            "source": item["source"],
-            "target": item["target"],
-        })
-
-    user_prompt = (
-        "จัดหมวดหมู่รายการต่อไปนี้ "
-        "โดยห้ามแก้ source และ target\n\n"
-        + json.dumps(
-            payload_items,
-            ensure_ascii=False,
-            indent=2
-        )
-    )
-
-    print(
-        f"   🧠 MEMORY CATEGORY "
-        f"[{batch_no}/{total_batches}] "
-        f"{len(items)} items"
-    )
-
-    for attempt in range(
-        1,
-        MEMORY_RETRIES + 1
-    ):
-        try:
-            raw = call_ollama_json(
-                MEMORY_SYSTEM_PROMPT,
-                user_prompt
-            )
-
-            data = json.loads(raw)
-            output = data.get("items", [])
-
-            if not isinstance(output, list):
-                raise ValueError(
-                    "AI output 'items' is not a list"
-                )
-
-            result = {}
-
-            valid_ids = {
-                int(item["id"])
-                for item in items
-            }
-
-            for item in output:
-                try:
-                    item_id = int(item["id"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-
-                if item_id not in valid_ids:
-                    continue
-
-                # รับจาก AI เฉพาะ category เท่านั้น
-                # source/target ไม่มีช่องให้ AI เปลี่ยน
-                category = str(
-                    item.get("category", "other")
-                ).strip().lower()
-
-                if category not in MEMORY_CATEGORIES:
-                    category = "other"
-
-                result[item_id] = category
-
-            missing = len(items) - len(result)
-
-            print(
-                f"      ✅ classified "
-                f"{len(result)}/{len(items)}"
-            )
-
-            if missing:
-                print(
-                    f"      ⚠️ missing category: "
-                    f"{missing} "
-                    f"(จะใช้ other)"
-                )
-
-            return result
-
-        except requests.Timeout:
-            print(
-                f"      ⚠️ timeout "
-                f"{attempt}/{MEMORY_RETRIES}"
-            )
-
-        except Exception as e:
-            print(
-                f"      ⚠️ category error "
-                f"{attempt}/{MEMORY_RETRIES}: {e}"
-            )
-
-    print("      ❌ skip category batch")
-    return {}
-
-
-# ============================================================
-# MEMORY UPDATE / REBUILD FROM ALL TRAINING DATA
-# ============================================================
-
-def load_all_training_examples():
-    """
-    อ่าน Training DB ทั้งหมด
-
-    จุดสำคัญ:
-    - ไม่ใช้เฉพาะ new_examples
-    - ไม่สนว่า run ปัจจุบัน duplicate หรือไม่
-    - ใช้ข้อมูลทั้งหมดที่สะสมใน translation_training_db.jsonl
-    """
-    examples = []
-
-    if not os.path.exists(TRAINING_DB_JSONL):
-        return examples
-
-    with open(
-        TRAINING_DB_JSONL,
-        "r",
-        encoding="utf-8"
-    ) as f:
-        for line in f:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            source = normalize_text(
-                item.get("source_zh", "")
-            )
-            target = normalize_text(
-                item.get("target_th", "")
-            )
-
-            if not source or not target:
-                continue
-
-            examples.append({
-                "source": source,
-                "target": target,
-                "example_type": item.get(
-                    "example_type",
-                    "approved"
-                ),
-                "id": item.get("id"),
-                "previous_similarity": item.get(
-                    "previous_similarity",
-                    0
-                ),
-            })
-
-    return examples
-
-
-def aggregate_training_memory_examples(examples):
-    """
-    รวม Source -> Target ที่เหมือนกันให้เหลือ 1 entry
-
-    count = จำนวนครั้งที่คู่ Source -> Target
-    ปรากฏใน Training DB
-    """
-    aggregated = {}
-
-    for example in examples:
-        source = normalize_text(
-            example.get("source", "")
-        )
-        target = normalize_text(
-            example.get("target", "")
-        )
-
-        if not source or not target:
-            continue
-
-        if not is_memory_candidate(
-            source,
-            target,
-            example.get("example_type", "approved")
-        ):
-            continue
-
-        key = memory_key(
-            source,
-            target
-        )
-
-        if key not in aggregated:
-            aggregated[key] = {
-                "source": source,
-                "target": target,
-                "count": 0,
-                "example_types": set(),
-            }
-
-        aggregated[key]["count"] += 1
-        aggregated[key]["example_types"].add(
-            example.get(
-                "example_type",
-                "approved"
-            )
-        )
-
-    # set -> list เพื่อให้ JSON serialize ได้
-    for item in aggregated.values():
-        item["example_types"] = sorted(
-            item["example_types"]
-        )
-
-    return aggregated
-
-
-def validate_memory_item(item):
-    """
-    ตรวจข้อมูล Memory ก่อนบันทึก
-    source/target ต้องเป็นข้อมูลจาก Training DB เท่านั้น
-    """
-    source = normalize_text(
-        item.get("source", "")
-    )
-    target = normalize_text(
-        item.get("target", "")
-    )
-
-    if not source or not target:
-        return False
-
-    category = str(
-        item.get("category", "other")
-    ).strip().lower()
-
-    if category not in MEMORY_CATEGORIES:
-        category = "other"
-
-    item["source"] = source
-    item["target"] = target
-    item["category"] = category
-
-    try:
-        item["count"] = max(
-            1,
-            int(item.get("count", 1))
-        )
-    except (TypeError, ValueError):
-        item["count"] = 1
-
-    return True
-
-
-def save_memory(memory):
-    """
-    บันทึก JSONL + JSON index
-    """
-    os.makedirs(
-        MEMORY_DIR,
-        exist_ok=True
-    )
-
-    valid_items = []
-
-    for item in memory.values():
-        if validate_memory_item(item):
-            valid_items.append(item)
-
-    valid_items.sort(
-        key=lambda x: (
-            x.get("count", 0),
-            x.get("category", ""),
-            x.get("source", "")
-        ),
-        reverse=True
-    )
-
-    with open(
-        MEMORY_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        for item in valid_items:
-            f.write(
-                json.dumps(
-                    item,
-                    ensure_ascii=False
-                ) + "\n"
-            )
-
-    by_category = {}
-
-    for item in valid_items:
-        category = item.get(
-            "category",
-            "other"
-        )
-
-        by_category.setdefault(
-            category,
-            []
-        ).append(item)
-
-    with open(
-        MEMORY_INDEX_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            {
-                "version": "2.0",
-                "updated_at": datetime.now().isoformat(
-                    timespec="seconds"
-                ),
-                "total": len(valid_items),
-                "categories": by_category,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
 
 
 def load_memory():
-    """
-    โหลด Memory เดิม
-
-    category เดิมจะถูกเก็บไว้ เพื่อไม่ต้องเรียก AI ซ้ำ
-    """
     memory = {}
 
-    if not os.path.exists(MEMORY_FILE):
+    if not os.path.exists(MEMORY_JSONL):
         return memory
 
-    with open(
-        MEMORY_FILE,
-        "r",
-        encoding="utf-8"
-    ) as f:
+    with open(MEMORY_JSONL, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
 
@@ -1051,525 +300,553 @@ def load_memory():
             except json.JSONDecodeError:
                 continue
 
-            source = normalize_text(
-                item.get("source", "")
-            )
-            target = normalize_text(
-                item.get("target", "")
-            )
+            source = normalize_text(item.get("source", ""))
+            target = normalize_text(item.get("target", ""))
 
             if not source or not target:
                 continue
 
-            key = memory_key(
-                source,
-                target
-            )
-
-            item["source"] = source
-            item["target"] = target
-
             category = str(
-                item.get("category", "")
-            ).strip().lower()
-
-            if category not in MEMORY_CATEGORIES:
-                category = ""
-
-            item["category"] = category
-
-            try:
-                item["count"] = max(
-                    1,
-                    int(item.get("count", 1))
-                )
-            except (TypeError, ValueError):
-                item["count"] = 1
-
-            memory[key] = item
-
-    return memory
-
-
-def classify_uncategorized_memory(
-    candidates,
-    memory
-):
-    """
-    ส่งเฉพาะรายการที่ยังไม่มี category ให้ AI
-
-    จุดสำคัญ:
-    - AI ไม่เห็นสิทธิ์ในการแก้ source/target
-    - AI คืน category เท่านั้น
-    - save หลังทุก batch
-    - ถ้าโปรแกรมหยุดกลางทาง รอบถัดไปจะทำต่อจาก
-      รายการที่ยังไม่มี category
-    """
-
-    uncategorized = []
-
-    for item in candidates:
-        key = memory_key(
-            item["source"],
-            item["target"]
-        )
-
-        current = memory.get(key)
-
-        if current:
-            category = str(
-                current.get("category", "")
-            ).strip().lower()
-
-            if category in MEMORY_CATEGORIES:
-                continue
-
-        uncategorized.append(item)
-
-    print(
-        f"   🧠 ต้องให้ AI จัดหมวดหมู่: "
-        f"{len(uncategorized)}"
-    )
-
-    if not uncategorized:
-        return
-
-    total_batches = (
-        len(uncategorized) +
-        MEMORY_BATCH_SIZE - 1
-    ) // MEMORY_BATCH_SIZE
-
-    for start in range(
-        0,
-        len(uncategorized),
-        MEMORY_BATCH_SIZE
-    ):
-        batch = uncategorized[
-            start:start + MEMORY_BATCH_SIZE
-        ]
-
-        batch_no = (
-            start // MEMORY_BATCH_SIZE
-        ) + 1
-
-        classifications = classify_memory_batch(
-            batch,
-            batch_no,
-            total_batches
-        )
-
-        # บันทึก category ที่ AI ให้มา
-        for item in batch:
-            item_id = item["id"]
-
-            category = classifications.get(
-                item_id,
-                "other"
-            )
+                item.get("category", "other")
+            ).lower()
 
             if category not in MEMORY_CATEGORIES:
                 category = "other"
 
-            key = memory_key(
-                item["source"],
-                item["target"]
+            try:
+                count = int(item.get("count", 1))
+            except (TypeError, ValueError):
+                count = 1
+
+            key = memory_key(source, target)
+
+            memory[key] = {
+                "source": source,
+                "target": target,
+                "category": category,
+                "count": max(count, 1),
+            }
+
+    return memory
+
+
+def save_memory(memory):
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+
+    items = list(memory.values())
+
+    items.sort(
+        key=lambda x: (
+            x.get("category", "other"),
+            x.get("source", ""),
+            x.get("target", ""),
+        )
+    )
+
+    # JSONL: ไม่มี id/index
+    with open(MEMORY_JSONL, "w", encoding="utf-8") as f:
+        for item in items:
+            f.write(
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                ) + "\n"
             )
 
-            if key not in memory:
-                memory[key] = {
-                    "source": item["source"],
-                    "target": item["target"],
-                    "category": category,
-                    "count": item["count"],
-                    "first_seen": datetime.now().isoformat(
-                        timespec="seconds"
-                    ),
-                    "last_seen": datetime.now().isoformat(
-                        timespec="seconds"
-                    ),
-                }
-            else:
-                memory[key]["category"] = category
+    # JSON: ไม่มี id/index เช่นกัน
+    by_category = {}
 
-        # สำคัญ: save ทุก batch
-        save_memory(memory)
+    for item in items:
+        category = item["category"]
+        by_category.setdefault(category, []).append(item)
 
-        print(
-            f"      💾 saved "
-            f"{min(start + len(batch), len(uncategorized))}/"
-            f"{len(uncategorized)}"
+    with open(MEMORY_JSON, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "categories": by_category,
+                "total": len(items),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
         )
 
 
-def rebuild_translation_memory():
+def validate_atomic_item(item, source_text, gold_text):
     """
-    REBUILD MEMORY จาก Training DB ทั้งหมด
-
-    Flow:
-
-        translation_training_db.jsonl
-                    ↓
-             aggregate pairs
-                    ↓
-             existing Memory
-                    ↓
-       AI classify เฉพาะที่ยังไม่มี category
-                    ↓
-          translation_memory.jsonl
-
-    ไม่มีการสร้าง/แก้ translation โดย AI
+    ตรวจหลัง AI:
+    - source ต้องอยู่ใน SOURCE
+    - target ต้องอยู่ใน GOLD
+    - ต้องไม่เป็นประโยคเต็มทั้งคู่
     """
 
-    print("\n" + "=" * 80)
-    print("TRANSLATION MEMORY")
-    print("=" * 80)
+    source = normalize_text(item.get("source", ""))
+    target = normalize_text(item.get("target", ""))
+    category = str(
+        item.get("category", "other")
+    ).strip().lower()
 
-    examples = load_all_training_examples()
+    source_normalized = normalize_text(source_text)
+    gold_normalized = normalize_text(gold_text)
+
+    if not source or not target:
+        return None
+
+    if source not in source_normalized:
+        return None
+
+    if target not in gold_normalized:
+        return None
+
+    # ห้ามเก็บทั้งประโยค
+    if source == source_normalized:
+        return None
+
+    if target == gold_normalized:
+        return None
+
+    if category not in MEMORY_CATEGORIES:
+        category = "other"
+
+    return {
+        "source": source,
+        "target": target,
+        "category": category,
+    }
+
+
+def extract_memory_batch(batch, batch_no, total_batches):
+    """
+    AI extract จาก Gold เท่านั้น
+    ไม่ใช้ AI RAG เป็นข้อมูลสำหรับ Memory
+    """
+
+    prompt_items = []
+
+    for item in batch:
+        prompt_items.append({
+            "source": item["source"],
+            "gold": item["gold"],
+        })
+
+    user_prompt = json.dumps(
+        {
+            "task": "Extract atomic translation-memory units.",
+            "items": prompt_items,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
     print(
-        f"Training DB records: "
-        f"{len(examples)}"
+        f"\n🧠 Memory batch "
+        f"{batch_no}/{total_batches} "
+        f"({len(batch)} subtitles)"
     )
 
-    if not examples:
-        print(
-            "❌ ไม่พบข้อมูลใน "
-            f"{TRAINING_DB_JSONL}"
-        )
-        return 0
+    for attempt in range(1, OLLAMA_RETRIES + 1):
+        try:
+            raw = call_ollama(
+                MEMORY_SYSTEM_PROMPT,
+                user_prompt,
+            )
 
-    aggregated = aggregate_training_memory_examples(
-        examples
-    )
+            data = json.loads(raw)
+            ai_items = data.get("items", [])
 
-    print(
-        f"Unique Source -> Gold pairs: "
-        f"{len(aggregated)}"
-    )
+            if not isinstance(ai_items, list):
+                raise ValueError(
+                    "Ollama output items ไม่ใช่ list"
+                )
+
+            valid = []
+
+            # AI output ไม่มี ID ที่จะนำไปเก็บใน Memory
+            # จับคู่ตาม SOURCE/GOLD ของ batch โดยตรวจ substring
+            for ai_item in ai_items:
+                source = normalize_text(
+                    ai_item.get("source", "")
+                )
+                target = normalize_text(
+                    ai_item.get("target", "")
+                )
+
+                if not source or not target:
+                    continue
+
+                matched = False
+
+                for original in batch:
+                    if (
+                        source in normalize_text(original["source"])
+                        and
+                        target in normalize_text(original["gold"])
+                    ):
+                        checked = validate_atomic_item(
+                            ai_item,
+                            original["source"],
+                            original["gold"],
+                        )
+
+                        if checked:
+                            valid.append(checked)
+                            matched = True
+                            break
+
+                if not matched:
+                    continue
+
+            print(
+                f"   ✅ AI extracted: {len(ai_items)}"
+                f" | validated: {len(valid)}"
+            )
+
+            return valid
+
+        except Exception as e:
+            print(
+                f"   ⚠️ Ollama error "
+                f"(attempt {attempt}/{OLLAMA_RETRIES}): {e}"
+            )
+
+    print("   ❌ ข้าม batch นี้")
+    return []
+
+
+# ============================================================
+# CONFLICT
+# ============================================================
+
+def build_memory_from_gold(gold_data, ai_data):
+    """
+    สำคัญ:
+    - ใช้ Gold เท่านั้นในการสร้าง Memory
+    - AI ใช้แค่เปรียบเทียบ ไม่แตะต้อง output
+    - Conflict จะยังไม่ถามทันที
+    - รวบรวมทั้งหมดก่อน แล้วถามตอนท้าย
+    """
 
     memory = load_memory()
 
-    # สร้าง/อัปเดต Memory จาก DB ทั้งหมด
-    # count จะถูกคำนวณใหม่จาก Training DB เสมอ
-    for key, item in aggregated.items():
-        existing = memory.get(key, {})
+    all_gold = []
 
-        category = str(
-            existing.get("category", "")
-        ).strip().lower()
+    for subtitle_id in sorted(gold_data):
+        gold_item = gold_data[subtitle_id]
 
-        if category not in MEMORY_CATEGORIES:
-            category = ""
+        all_gold.append({
+            "id": subtitle_id,
+            "source": gold_item["source"] if "source" in gold_item else "",
+            "gold": gold_item["text"],
+        })
 
+    # SRT Gold ไม่มี source field เพราะเป็นไฟล์ภาษาไทย
+    # ดังนั้น source จะถูกเติมจาก input/source ใน main
+    return memory
+
+
+def extract_gold_memory(source_data, gold_data):
+    """
+    สร้างรายการ SOURCE(Gold pair) สำหรับ AI extraction
+    """
+
+    pairs = []
+
+    common_ids = sorted(
+        set(source_data) & set(gold_data)
+    )
+
+    for subtitle_id in common_ids:
+        source = normalize_text(
+            source_data[subtitle_id]["text"]
+        )
+        gold = normalize_text(
+            gold_data[subtitle_id]["text"]
+        )
+
+        if not source or not gold:
+            continue
+
+        pairs.append({
+            "id": subtitle_id,
+            "source": source,
+            "gold": gold,
+        })
+
+    return pairs
+
+
+def add_extracted_to_memory(memory, extracted):
+    """
+    เพิ่ม Memory แบบไม่ถาม Conflict ทันที
+
+    Duplicate:
+      source + target เหมือนกัน -> count + 1
+
+    Conflict:
+      source เหมือน แต่ target ต่างกัน
+      -> ส่งเข้า conflict list
+    """
+
+    conflicts = []
+    duplicate_count = 0
+    added_count = 0
+
+    # รวมรายการในรอบนี้ก่อน
+    current_by_source = {}
+
+    for item in extracted:
+        source = item["source"]
+        target = item["target"]
+        category = item["category"]
+
+        key = memory_key(source, target)
+
+        if key in memory:
+            memory[key]["count"] += 1
+            duplicate_count += 1
+            continue
+
+        # ตรวจ source เดียวกันแต่ target ต่างกัน
+        source_key = normalize_text(source).casefold()
+
+        existing_same_source = [
+            x for x in memory.values()
+            if normalize_text(x["source"]).casefold()
+            == source_key
+            and normalize_text(x["target"]).casefold()
+            != normalize_text(target).casefold()
+        ]
+
+        if source_key in current_by_source:
+            for previous in current_by_source[source_key]:
+                if memory_key(
+                    previous["source"],
+                    previous["target"],
+                ) != key:
+                    conflicts.append({
+                        "source": source,
+                        "old": previous["target"],
+                        "new": target,
+                        "old_category": previous["category"],
+                        "new_category": category,
+                    })
+
+        if existing_same_source:
+            for old in existing_same_source:
+                conflicts.append({
+                    "source": source,
+                    "old": old["target"],
+                    "new": target,
+                    "old_category": old["category"],
+                    "new_category": category,
+                })
+
+        # ยังเพิ่ม candidate ใหม่เข้า memory
+        # แต่ conflict จะถูกแก้ภายหลังในขั้นตอนเดียว
         memory[key] = {
-            "source": item["source"],
-            "target": item["target"],
+            "source": source,
+            "target": target,
             "category": category,
-            "count": item["count"],
-            "example_types": item[
-                "example_types"
-            ],
-            "first_seen": existing.get(
-                "first_seen",
-                datetime.now().isoformat(
-                    timespec="seconds"
-                )
-            ),
-            "last_seen": datetime.now().isoformat(
-                timespec="seconds"
-            ),
+            "count": 1,
         }
 
-    save_memory(memory)
-
-    # รายการที่ยังไม่มี category
-    candidates = []
-
-    next_id = 1
-
-    for key, item in aggregated.items():
-        candidates.append({
-            "id": next_id,
-            "source": item["source"],
-            "target": item["target"],
-            "count": item["count"],
-            "example_types": item[
-                "example_types"
-            ],
+        current_by_source.setdefault(
+            source_key, []
+        ).append({
+            "source": source,
+            "target": target,
+            "category": category,
         })
-        next_id += 1
 
-    before_classification = sum(
-        bool(
-            str(
-                memory.get(
-                    memory_key(
-                        item["source"],
-                        item["target"]
-                    ),
-                    {}
-                ).get("category", "")
-            ).strip()
+        added_count += 1
+
+    return memory, conflicts, duplicate_count, added_count
+
+
+def unique_conflicts(conflicts):
+    result = []
+    seen = set()
+
+    for c in conflicts:
+        key = (
+            normalize_text(c["source"]).casefold(),
+            normalize_text(c["old"]).casefold(),
+            normalize_text(c["new"]).casefold(),
         )
-        for item in candidates
-    )
 
-    print(
-        f"Already categorized: "
-        f"{before_classification}"
-    )
+        # A/B กับ B/A ถือเป็น conflict เดียวกัน
+        reverse = (
+            key[0],
+            key[2],
+            key[1],
+        )
 
-    classify_uncategorized_memory(
-        candidates,
-        memory
-    )
+        if key in seen or reverse in seen:
+            continue
 
-    # Final save
-    save_memory(memory)
+        seen.add(key)
+        result.append(c)
 
-    categorized = 0
+    return result
 
-    for item in memory.values():
-        if item.get("category") in MEMORY_CATEGORIES:
-            categorized += 1
 
-    print(
-        f"\n   ✅ Total Memory: "
-        f"{len(memory)}"
-    )
-    print(
-        f"   🏷️ Categorized: "
-        f"{categorized}"
-    )
-    print(
-        f"   ⏳ Uncategorized: "
-        f"{len(memory) - categorized}"
-    )
+def resolve_conflicts(memory, conflicts):
+    """
+    หลัง extract ทั้งหมดแล้วจึงถาม Conflict ทีเดียว
 
-    print(
-        f"\n   📁 Memory:"
-        f"\n   {MEMORY_FILE}"
-    )
-    print(
-        f"\n   📁 Index:"
-        f"\n   {MEMORY_INDEX_FILE}"
-    )
+    1 = เก่า
+    2 = ใหม่
+    3 = ทั้งคู่
+    """
 
-    return len(memory)
+    conflicts = unique_conflicts(conflicts)
+
+    if not conflicts:
+        print("\n✅ ไม่พบ Conflict")
+        return memory
+
+    print("\n" + "=" * 80)
+    print(f"⚠️ MEMORY CONFLICTS: {len(conflicts)}")
+    print("=" * 80)
+
+    for number, conflict in enumerate(conflicts, 1):
+        source = conflict["source"]
+        old = conflict["old"]
+        new = conflict["new"]
+
+        print("\n" + "-" * 80)
+        print(f"Conflict {number}/{len(conflicts)}")
+        print(f"Source : {source}")
+        print(f"1 เก่า : {old}")
+        print(f"2 ใหม่ : {new}")
+        print("3 ทั้งคู่")
+
+        while True:
+            choice = input(
+                "เลือก [1/2/3]: "
+            ).strip()
+
+            if choice in {"1", "2", "3"}:
+                break
+
+            print("กรุณาเลือก 1, 2 หรือ 3")
+
+        old_key = memory_key(source, old)
+        new_key = memory_key(source, new)
+
+        if choice == "1":
+            # เก็บเก่า, ลบใหม่
+            if new_key in memory:
+                del memory[new_key]
+
+        elif choice == "2":
+            # ลบเก่า, เก็บใหม่
+            if old_key in memory:
+                old_count = memory[old_key].get("count", 1)
+            else:
+                old_count = 0
+
+            if new_key in memory:
+                memory[new_key]["count"] += 1
+            else:
+                memory[new_key] = {
+                    "source": source,
+                    "target": new,
+                    "category": conflict["new_category"],
+                    "count": max(1, old_count),
+                }
+
+            if old_key in memory:
+                del memory[old_key]
+
+        elif choice == "3":
+            # เก็บทั้งคู่ ไม่ทำอะไร
+            pass
+
+    return memory
 
 
 # ============================================================
 # REPORT
 # ============================================================
 
-def print_summary(
-    source,
-    gold,
-    rag,
-    results
-):
+def print_comparison(results):
+    print("\n" + "=" * 80)
+    print("GOLD vs AI RAG")
+    print("=" * 80)
+
+    for item in results:
+        print(
+            f"[{item['id']}] "
+            f"{item['similarity']:.2%}"
+        )
+
+        print(f"  GOLD: {item['gold']}")
+        print(f"  AI  : {item['ai']}")
+        print()
+
     valid = [
         x for x in results
-        if x["source_exists"]
-        and x["gold_exists"]
-        and x["rag_exists"]
+        if x["gold_exists"] and x["ai_exists"]
     ]
 
-    same = sum(
-        x["same"]
-        for x in valid
-    )
+    overall = calculate_overall_score(results)
 
-    different = (
-        len(valid) - same
-    )
-
-    avg = (
-        sum(
-            x["gold_vs_rag"]
-            for x in valid
-        ) / len(valid)
-        if valid else 0
-    )
-
-    print("\n" + "=" * 80)
-    print("SRT RAG COMPARISON")
-    print("=" * 80)
-
-    print(f"\nSOURCE:\n{source}")
-    print(f"\nGOLD STANDARD:\n{gold}")
-    print(f"\nRAG OUTPUT:\n{rag}")
-
-    print("\n" + "-" * 80)
-    print(
-        f"จำนวน subtitle ทั้งหมด: "
-        f"{len(results)}"
-    )
-    print(
-        f"Gold และ RAG เหมือนกัน: "
-        f"{same}"
-    )
-    print(
-        f"Gold และ RAG ต่างกัน: "
-        f"{different}"
-    )
-    print(
-        f"ค่าเฉลี่ยความเหมือน RAG <-> Gold: "
-        f"{avg:.2%}"
-    )
+    print("-" * 80)
+    print(f"เปรียบเทียบทั้งหมด: {len(results)}")
+    print(f"มีทั้ง Gold และ AI: {len(valid)}")
+    print(f"คะแนนรวม Gold ↔ AI: {overall:.2%}")
 
 
-def print_differences(results):
-    differences = [
-        x for x in results
-        if x["gold_exists"]
-        and x["rag_exists"]
-        and not x["same"]
-    ]
+def save_comparison(results, gold_file, ai_file):
+    os.makedirs(COMPARISON_DIR, exist_ok=True)
 
-    print("\n" + "=" * 80)
-    print(
-        f"DIFFERENCES: "
-        f"{len(differences)}"
-    )
-    print("=" * 80)
+    overall = calculate_overall_score(results)
 
-    for item in differences:
-        print("\n" + "-" * 80)
-        print(
-            f"[{item['index']}] "
-            f"{item['timecode']}"
-        )
-
-        print("\nSOURCE:")
-        print(item["source"])
-
-        print("\nGOLD:")
-        print(item["gold"])
-
-        print("\nRAG:")
-        print(item["rag"])
-
-        print(
-            f"\nGold <-> RAG: "
-            f"{item['gold_vs_rag']:.2%}"
-        )
-
-
-def save_report(
-    path,
-    source,
-    gold,
-    rag,
-    results
-):
-    os.makedirs(
-        REPORT_DIR,
-        exist_ok=True
-    )
+    data = {
+        "gold_file": os.path.basename(gold_file),
+        "ai_file": os.path.basename(ai_file),
+        "overall_similarity": round(overall, 6),
+        "items": results,
+    }
 
     with open(
-        path,
+        COMPARISON_JSON,
         "w",
-        encoding="utf-8"
+        encoding="utf-8",
     ) as f:
-        f.write(
-            "SRT RAG COMPARISON REPORT\n"
-        )
-        f.write(
-            "=" * 80 + "\n\n"
-        )
-
-        f.write(
-            f"SOURCE:\n{source}\n\n"
-        )
-        f.write(
-            f"GOLD STANDARD:\n{gold}\n\n"
-        )
-        f.write(
-            f"RAG OUTPUT:\n{rag}\n\n"
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2,
         )
 
-        valid = [
-            x for x in results
-            if x["source_exists"]
-            and x["gold_exists"]
-            and x["rag_exists"]
-        ]
-
-        same = sum(
-            x["same"]
-            for x in valid
-        )
-
-        different = (
-            len(valid) - same
-        )
-
-        avg = (
-            sum(
-                x["gold_vs_rag"]
-                for x in valid
-            ) / len(valid)
-            if valid else 0
-        )
-
+    with open(
+        COMPARISON_REPORT,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write("GOLD vs AI RAG COMPARISON\n")
+        f.write("=" * 80 + "\n\n")
         f.write(
-            f"TOTAL: {len(results)}\n"
+            f"Gold: {gold_file}\n"
+            f"AI:   {ai_file}\n"
         )
         f.write(
-            f"SAME: {same}\n"
-        )
-        f.write(
-            f"DIFFERENT: {different}\n"
-        )
-        f.write(
-            f"AVERAGE GOLD/RAG SIMILARITY: "
-            f"{avg:.2%}\n\n"
-        )
-
-        f.write(
-            "=" * 80 + "\n"
-        )
-        f.write(
-            "DIFFERENCES\n"
-        )
-        f.write(
-            "=" * 80 + "\n"
+            f"Overall similarity: {overall:.2%}\n\n"
         )
 
         for item in results:
-            if not item["gold_exists"]:
-                continue
-
-            if not item["rag_exists"]:
-                continue
-
-            if item["same"]:
-                continue
-
             f.write(
-                f"\n[{item['index']}] "
-                f"{item['timecode']}\n"
+                f"[{item['id']}] "
+                f"{item['similarity']:.2%}\n"
             )
             f.write(
-                f"\nSOURCE:\n"
-                f"{item['source']}\n"
+                f"GOLD: {item['gold']}\n"
             )
             f.write(
-                f"\nGOLD:\n"
-                f"{item['gold']}\n"
-            )
-            f.write(
-                f"\nRAG:\n"
-                f"{item['rag']}\n"
-            )
-            f.write(
-                f"\nSimilarity: "
-                f"{item['gold_vs_rag']:.2%}\n"
-            )
-            f.write(
-                "-" * 80 + "\n"
+                f"AI:   {item['ai']}\n\n"
             )
 
 
@@ -1578,168 +855,186 @@ def save_report(
 # ============================================================
 
 def main():
-    os.makedirs(
-        INPUT_DIR,
-        exist_ok=True
-    )
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True
-    )
-    os.makedirs(
-        REPORT_DIR,
-        exist_ok=True
-    )
-    os.makedirs(
-        MEMORY_DIR,
-        exist_ok=True
-    )
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(COMPARISON_DIR, exist_ok=True)
+    os.makedirs(MEMORY_DIR, exist_ok=True)
 
+    print("\n" + "=" * 80)
+    print("GOLD / AI COMPARATOR + TRANSLATION MEMORY")
+    print("=" * 80)
+
+    # 1. INPUT CHINESE
     source_file = select_file(
         INPUT_DIR,
-        "1. เลือกไฟล์ต้นฉบับภาษาจีน"
+        "1. เลือกไฟล์ INPUT ภาษาจีน",
     )
 
     if not source_file:
         return
 
+    # 2. GOLD
     gold_file = select_file(
         OUTPUT_DIR,
-        "2. เลือกไฟล์ Gold Standard"
+        "2. เลือกไฟล์ OUTPUT - GOLD ที่คนแปลแล้ว",
     )
 
     if not gold_file:
         return
 
-    rag_file = select_file(
+    # 3. AI RAG
+    ai_file = select_file(
         OUTPUT_DIR,
-        "3. เลือกไฟล์ RAG Output"
+        "3. เลือกไฟล์ OUTPUT - AI RAG",
     )
 
-    if not rag_file:
+    if not ai_file:
         return
 
     print("\n" + "=" * 80)
     print("SELECTED FILES")
     print("=" * 80)
 
-    print(f"\nSOURCE:\n{source_file}")
-    print(f"\nGOLD:\n{gold_file}")
-    print(f"\nRAG:\n{rag_file}")
+    print(f"INPUT : {source_file}")
+    print(f"GOLD  : {gold_file}")
+    print(f"AI RAG: {ai_file}")
 
-    print("\nกำลังเปรียบเทียบ...")
+    print("\nกำลังอ่านไฟล์...")
 
-    results = compare_srt(
-        source_file,
+    source_data = parse_srt(source_file)
+    gold_data = parse_srt(gold_file)
+    ai_data = parse_srt(ai_file)
+
+    # --------------------------------------------------------
+    # Compare
+    # --------------------------------------------------------
+
+    print("\nกำลังเปรียบเทียบ Gold กับ AI RAG...")
+
+    results = compare_gold_ai(
+        gold_data,
+        ai_data,
+    )
+
+    print_comparison(results)
+
+    save_comparison(
+        results,
         gold_file,
-        rag_file
-    )
-
-    print_summary(
-        source_file,
-        gold_file,
-        rag_file,
-        results
-    )
-
-    print_differences(results)
-
-    # --------------------------------------------------------
-    # Comparison report
-    # --------------------------------------------------------
-
-    report_path = os.path.join(
-        REPORT_DIR,
-        "comparison.txt"
-    )
-
-    save_report(
-        report_path,
-        source_file,
-        gold_file,
-        rag_file,
-        results
+        ai_file,
     )
 
     # --------------------------------------------------------
-    # Training data
+    # Memory extraction
     # --------------------------------------------------------
+
+    print("\n" + "=" * 80)
+    print("BUILD TRANSLATION MEMORY FROM GOLD")
+    print("=" * 80)
+
+    pairs = extract_gold_memory(
+        source_data,
+        gold_data,
+    )
+
+    print(
+        f"Gold pairs สำหรับ Memory: {len(pairs)}"
+    )
+
+    if not pairs:
+        print(
+            "❌ ไม่พบ SOURCE/GOLD ID ที่ตรงกัน"
+        )
+        return
+
+    extracted = []
+
+    total_batches = (
+        len(pairs) + MEMORY_BATCH_SIZE - 1
+    ) // MEMORY_BATCH_SIZE
+
+    for start in range(
+        0,
+        len(pairs),
+        MEMORY_BATCH_SIZE,
+    ):
+        batch = pairs[
+            start:start + MEMORY_BATCH_SIZE
+        ]
+
+        batch_result = extract_memory_batch(
+            batch,
+            start // MEMORY_BATCH_SIZE + 1,
+            total_batches,
+        )
+
+        extracted.extend(batch_result)
+
+    print(
+        f"\nAtomic Memory หลัง validation: "
+        f"{len(extracted)}"
+    )
+
+    # --------------------------------------------------------
+    # Duplicate + Conflict collection
+    # --------------------------------------------------------
+
+    memory = load_memory()
 
     (
-        new_examples,
-        duplicate_in_run,
-        duplicate_from_history
-    ) = export_training_data(
-        results,
-        source_file,
-        gold_file,
-        rag_file
+        memory,
+        conflicts,
+        duplicate_count,
+        added_count,
+    ) = add_extracted_to_memory(
+        memory,
+        extracted,
     )
 
-    print("\n" + "=" * 80)
-    print("TRAINING EXPORT")
-    print("=" * 80)
-
+    print("\n" + "-" * 80)
+    print(f"Memory ใหม่: {added_count}")
+    print(f"Duplicate: {duplicate_count}")
     print(
-        f"\nNew training examples: "
-        f"{len(new_examples)}"
-    )
-
-    print(
-        f"Duplicates in current run: "
-        f"{duplicate_in_run}"
-    )
-
-    print(
-        f"Duplicates from history: "
-        f"{duplicate_from_history}"
-    )
-
-    print(
-        f"\n1. {TRAINING_JSONL}"
-    )
-    print(
-        f"2. {TRAINING_JSON}"
-    )
-    print(
-        f"3. {FEEDBACK_JSON}"
-    )
-    print(
-        f"4. {TRAINING_DB_JSONL}"
+        f"Conflict ที่รวบรวมไว้: "
+        f"{len(unique_conflicts(conflicts))}"
     )
 
     # --------------------------------------------------------
-    # Translation Memory
+    # Resolve ALL conflicts only after extraction is complete
     # --------------------------------------------------------
-    #
-    # สำคัญ:
-    # Memory ไม่ใช้เฉพาะ new_examples
-    # แต่ rebuild จาก translation_training_db.jsonl ทั้งหมด
-    #
-    rebuild_translation_memory()
+
+    memory = resolve_conflicts(
+        memory,
+        conflicts,
+    )
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
+    save_memory(memory)
 
     print("\n" + "=" * 80)
-    print("FILES")
+    print("DONE")
     print("=" * 80)
 
     print(
-        f"\nComparison report:\n"
-        f"{report_path}"
+        f"Memory total: {len(memory)}"
     )
-
     print(
-        f"\nTranslation Memory:\n"
-        f"{MEMORY_FILE}"
+        f"Memory JSONL: {MEMORY_JSONL}"
     )
-
     print(
-        f"\nMemory index:\n"
-        f"{MEMORY_INDEX_FILE}"
+        f"Memory JSON:  {MEMORY_JSON}"
+    )
+    print(
+        f"Comparison:   {COMPARISON_JSON}"
+    )
+    print(
+        f"Report:       {COMPARISON_REPORT}"
     )
 
-    print("\n" + "=" * 80)
-    print("เสร็จสิ้น")
-    print("=" * 80)
+    print("\n⚠️ AI RAG output ไม่ถูกแก้ไข")
 
 
 if __name__ == "__main__":
